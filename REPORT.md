@@ -431,11 +431,11 @@ row, adaptive pin, 4 KiB leak, fresh-fork producers):
 
 | Target | Result | Time |
 |---|---|---|
-| fresh containers A-H | `uid=33(www-data)` on all eight | 24-26 s each |
+| fresh containers A-I | `uid=33(www-data)` on all nine | 24-26 s each |
 | same container C, `--base/--h` reuse | `uid=33(www-data)` | 24 s |
-| fresh container I | stopped before arming: `0x7c` in the fake-string pointer | - |
+| fresh container J | stopped before arming: `0x7c` in the fake-string pointer | - |
 
-Eight consecutive fresh-container successes were measured after the pin-rate
+Nine consecutive fresh-container successes were measured after the pin-rate
 and leak-ordering fixes.  The one stop was the ASLR gate, detected from the
 leaked `H` before any session-file work; it is not a heap or timing failure.
 

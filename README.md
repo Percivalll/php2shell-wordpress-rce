@@ -107,7 +107,7 @@ Stability batch after the pin/leak/ordering fixes:
 
 | Target | Result | Time |
 |---|---|---|
-| 8 fresh containers | 8/8 `uid=33(www-data)` | 24-26 s each |
+| 9 fresh containers (final driver) | 9/9 `uid=33(www-data)` | 24-26 s each |
 | same container, `--base/--h` reuse | 1/1 `uid=33(www-data)` | 24 s |
 | 1 further fresh container | stopped before arming: `0x7c` in `H` pointer bytes | - |
 
