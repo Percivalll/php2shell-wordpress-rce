@@ -75,17 +75,20 @@ Target constraints:
 - Use the image defaults; no plugins, WordPress database, or authentication.
 - The default deployment has 150 prefork workers. The PoC pins 149 of them and
   leaves one free worker.
-- The chain depends probabilistically on ASLR and heap layout. Retries are
-  expected, but every retry is still HTTP-only.
+- Once the worker pin is exact, the leak and arm stages are deterministic for a
+  given image build.  The remaining random condition is a per-process ASLR
+  gate (`0x7c` in the fake-string pointer), detected before arming.
 
 ## 2. Architecture
 
     Attacker client (outside the container)
       |
-      +- run_ext.py              orchestration: pin -> leak -> files -> rotate -> arm -> R1/R2 -> proof
-      |    +- pin_slow_pause.py  149 unfinished chunked POSTs
+      +- run_ext.py              orchestration: pin -> leak -> rotate -> r1big -> frame -> rotate -> arm -> R1/R2 -> proof
+      |    +- pin_adaptive.py    discover the worker count, free exactly one
+      |    +- pin_slow_pause.py  fixed 149-connection pin
+      |    +- big_a.py / b_leak20.py  A/B leak requests
+      |    +- early_ok.py / arm_file2.py  arm producer and trigger
       |    +- profiles.py        A/B requests and leak parser
-      |    +- arm.py             arm producer and trigger
       |    +- stage_rce.py        sess_r1big / sess_trig2 / R1 / R2
       |    +- transport.py       HTTP and multipart transport
       |
@@ -96,9 +99,14 @@ Repository files:
 | File | Purpose |
 |---|---|
 | exploit/run_ext.py | End-to-end orchestration, leak parser, rotation/retry, proof fetch |
+| exploit/pin_adaptive.py | Opens pins until the pool is saturated, then frees exactly one worker |
 | exploit/pin_slow_pause.py | 149 unfinished chunked POSTs; leaves one free worker |
+| exploit/big_a.py | Parameterised A request (heap-grooming knobs) |
+| exploit/b_leak20.py | B request and 4 KiB OOB read |
+| exploit/early_ok.py | Arm producer |
+| exploit/arm_file2.py | Arm trigger with dummy-filename grooming |
+| exploit/poc.py | Legacy request helpers used by the A/B tools |
 | exploit/profiles.py | A/B request profiles and leak parser |
-| exploit/arm.py | Arm producer and trigger |
 | exploit/stage_rce.py | Session-file producers, R1, and R2 |
 | exploit/transport.py | Multipart construction and HTTP transport |
 | demo.sh | One-command PoC runner using a published port |
@@ -109,12 +117,16 @@ Apache prefork starts 150 workers by default; MaxSpareServers=10 would reap idle
 workers. A normal keep-alive pin is therefore unstable. The PoC instead uses
 unfinished chunked POST bodies:
 
-- Each connection sends POST /, Transfer-Encoding: chunked, and one valid 512 B
+- Each connection sends POST /, Transfer-Encoding: chunked, and one valid 4 KiB
   chunk, but never sends the terminating zero chunk.
 - Each worker is busy reading the body, so the MPM does not treat it as idle and
   MaxSpareServers cannot reap it.
-- Every second, the client sends another 512 B chunk on each socket to avoid the
-  mod_reqtimeout body timeout.
+- Every second, the client sends another 4 KiB chunk on each socket.  Apache's
+  `mod_reqtimeout` is configured as `body=10,minrate=500`; the original 512 B/s
+  traffic was only 2.4% above the minimum and a scheduling hiccup silently
+  closed pins.  Each lost pin let prefork add an idle worker, after which the
+  attack requests no longer landed on one child.  4 KiB/s is 8x the minimum and
+  keeps the pool exact for the whole chain.
 - 149 connections occupy 149 workers. The remaining single free worker handles
   all attack requests.
 
@@ -189,6 +201,14 @@ run_ext.py additionally scans known libphp data-pointer offsets such as
 accepts the candidate with the highest count; the real base usually receives 14
 votes, while the minimum threshold is 4.
 
+The 4 KiB window is the source of **both** the base and the chunk.  A 2 MiB
+read can also return the correct libphp base (verified against the worker's
+maps), but its dominant 2 MiB bucket is a different chunk.  Using that bucket
+for `H` yields a plausible-looking address that does not match the arm's
+`BG.data`; the R1 fake serializer is then written to the wrong place.  The
+driver therefore keeps the chunk from the 4 KiB window even when the base came
+from a larger read.
+
 Observed samples:
 
 | Run | libphp base | chunk | H |
@@ -201,10 +221,15 @@ Observed samples:
 
 Larger reads (1.7 MB, 2 MB, 3 MB) depend on whether memory after the ZendMM
 chunk is mapped contiguously. On some containers they SIGSEGV, so B returns no
-response. A 4 KiB read reliably returns 200; the handler cluster at raw[0x6c8]
-usually appears after a retry (the second attempt in the samples). The final
-implementation therefore uses a 4 KiB read plus retries instead of one large
-window.
+response. A 4 KiB read reliably returns 200. The handler cluster at raw[0x6c8]
+appears once `index.php` has been compiled in this child: its op_array is laid
+out at the head of the ZendMM chunk, directly behind the stale session string.
+The first B of a fresh container may miss; the second returns the chunk; by the
+third the cluster and the 14-vote base are present.  If `index.php` is already
+cached in opcache (for example after `producer-bigfn`), the same window is
+zeroed heap and no number of retries will bring the pointers back.  `run_ext.py`
+therefore leaks **before** any request that executes `index.php` and retries in
+place instead of rotating.
 
 ## 5. Writing the Two Session Files
 
@@ -244,9 +269,10 @@ Measured file size:
 
 The trailing 120 MB field causes OOM after the file has been written.
 zend_bailout() skips the MULTIPART_EVENT_END upload-progress cleanup, so the
-file remains. run_ext.py performs this step before pinning so a fresh worker in
-the new container writes the full file; this avoids a worker with an already
-high real_size writing only a short file.
+file remains.  The write must happen on a freshly forked child: after the leak
+or any earlier OOM, `real_size` is already close enough to the limit that the
+30 MiB filename allocation aborts before the session flush, leaving a 322-byte
+file.  `run_ext.py` rotates first and then runs `producer-bigfn`.
 
 R1 reads this file with PHPSESSID=r1big. The 30 MB filename is the value-side
 OOM trigger in R1.
@@ -276,7 +302,9 @@ the PoC sends:
 
 The 8 MiB read normally triggers SIGSEGV, the current free worker exits, and
 Apache prefork forks a clean worker. The new worker's ZendMM chunk base remains
-consistent with the leaked chunk.
+consistent with the leaked chunk.  A complete response means the read stayed in
+mapped memory and the child survived; the driver treats only `resp 0` / no
+status line as success, and retries with 12 MiB and 24 MiB reads otherwise.
 
 ### 6.2 Arming
 
@@ -398,6 +426,19 @@ Three independent runs produced:
 | run-2 | published port 18100 | 0x78cde6d86000 | 0x78cde5000000 | 0x78cde506a000 |
 | default | no published port, external tunnel | 0x73e6330d7000 | 0x73e631400000 | 0x73e63146a000 |
 
+Stability batch with the final driver (a fresh `wordpress:7.1.2` container per
+row, adaptive pin, 4 KiB leak, fresh-fork producers):
+
+| Target | Result | Time |
+|---|---|---|
+| fresh containers A-H | `uid=33(www-data)` on all eight | 24-26 s each |
+| same container C, `--base/--h` reuse | `uid=33(www-data)` | 24 s |
+| fresh container I | stopped before arming: `0x7c` in the fake-string pointer | - |
+
+Eight consecutive fresh-container successes were measured after the pin-rate
+and leak-ordering fixes.  The one stop was the ASLR gate, detected from the
+leaked `H` before any session-file work; it is not a heap or timing failure.
+
 The default run used only docker run -d --name ... with no -e, -v, --cap-add, or
 --privileged option. The anonymous /var/www/html volume was created by the
 image's own VOLUME declaration. The run reached the container HTTP port through
@@ -431,12 +472,13 @@ target. It does not call Docker, gdb, or /proc.
 | Symptom | Cause | Action |
 |---|---|---|
 | B returns no Set-Cookie or response 0 | Heap layout miss or a large OOB read hit an unmapped page | Retry with a 4 KiB read; do not rely on 2/3 MiB reads |
-| Leak returns 4104 B but no handler pointer | raw[0x6c8] is still a heap pointer | Send another A+B round; the handler cluster usually appears on the second attempt |
+| Leak returns 4104 B but no handler pointer | `index.php` is already cached in opcache (the leak ran after `producer-bigfn`) or the first-round op_array is not laid out yet | Leak before any `index.php` request; retry in place; do not rotate during the leak |
 | Arm trigger returns 302 | Worker did not reach the intended OOM window | Rotate with A + 8 MiB B and retry |
-| H+0x400 contains 0x7c | The PHP session key treats it as a pipe delimiter | Start a fresh container to re-randomize |
-| sess_r1big is only a few hundred bytes | producer-bigfn OOMed early on a dirty worker | Write r1big before pinning |
-| Pin holds only 75/125 workers | Worker count is not 150 or pins were reaped | Confirm the default MaxRequestWorkers=150 and adjust the pin count |
-| PS(serializer) is unchanged after R1 | base/H mismatch | Check leak votes, the chunk cluster, and H=chunk+0x6a000 |
+| H+0x400 contains 0x7c | Per-process ASLR: every mmap address in this child shares that byte; PHP rejects the upload-progress key as a session delimiter | Start a fresh container / use another target process |
+| sess_r1big is only a few hundred bytes | `producer-bigfn` ran on a dirty worker whose `real_size` was already high | Rotate to a fresh child first; run `producer-bigfn` there |
+| Pin holds fewer workers or requests split across children | Pins dropped below `mod_reqtimeout`'s 500 B/s body minimum (the old 512 B/s traffic) | Send 4 KiB/s; use the adaptive pin and watch the `dropped` counter |
+| Base looks right but R1/R2 fail | `H` came from a 2 MiB window's dominant cluster instead of the 4 KiB chunk | Use `chunk` from the 4 KiB read; `H = chunk + 0x6a000` |
+| PS(serializer) is unchanged after R1 | base/H mismatch | Check leak votes and the 4 KiB chunk; verify `BG.data` in the lab |
 
 ## 13. Defensive Recommendations
 
