@@ -510,6 +510,92 @@ port, no extra environment variables, no extra volumes, and no added
 capabilities. The issue is not a WordPress plugin or authentication flaw; it is
 the combination of PHP session/OOM state and cross-request prefork residue.
 
+## 15. Alternative Primitive Assessment (not used)
+
+The shipped chain is the fake-`ps_serializer` route.  Two alternatives were
+implemented far enough to measure their limits.  They are recorded here as
+negative results so future work does not repeat them.
+
+### 15.1 PG(auto_prepend_file) overwrite
+
+Target resolution:
+
+- `core_globals` is `libphp+0x1059100`.
+- The runtime `zend_ini_entry_def` for `auto_prepend_file` has
+  `mh_arg1=0xa0` and `mh_arg2=&core_globals`, so the field is
+  `base+0x10591a0`.
+- The fake `var_entries` write reaches that address and `/proc` reads it back;
+  the write itself is not the problem.
+
+Write-value problem:
+
+- `var_entries` is `{ zend_long used_slots; void *next; zval *data[...]; }`;
+  `data` starts at `+0x10`.  `var_push` executes
+  `var_hash->data[used_slots] = rval`, where `rval` points at the
+  unserializer's dtor temp zval.
+- `var_push_dtor` fills the same slot with a zval.  The value written to
+  `PG(auto_prepend_file)` is therefore the zval's address, not a filename.
+- The working fake serializer uses the 16-byte zval at `H+0x310` as a boundary:
+  its `decode` pointer sits at `H+0x320`, immediately after the zval, so the
+  dtor cannot clobber the pointer the chain needs.  A path string at
+  `H+0x310` is always clobbered.
+
+Layout constraints found:
+
+- A 30 MiB `sess_r1big` is required to keep the session file buffer out of the
+  ZendMM chunk head.  With a 326-byte session file the buffer landed at `H`
+  and `H+0x10` became 326; `var_tmp_var` dereferenced 326 and SIGSEGV'd at
+  `base+0x3fa1fe`.
+- PHP's upload-progress array keeps only one file (`files a:1` even for two
+  file parts) and does not store `type`; there is no controllable large
+  allocation after a small `name`.
+- A 5 MiB progress-key kept the session large enough but changed the heap so
+  the 64 fake fields no longer populated `H` (`H+0x00` was not `H+0x200`); the
+  worker crashed at `base+0x4b7d4b`.
+- A 30 MiB filename whose first bytes are `/tmp/sess_pgshell\0` keeps `H`
+  populated and sets `PG=H+0x310`, but after the OOM the huge allocation is no
+  longer a mapped `zend_string` (a scan of the worker found no 30 MiB header).
+
+Conclusion: this route needs a raw 8-byte write, or a mapped-chunk groom the
+current `var_push` primitive does not provide.
+
+### 15.2 OPcache type confusion
+
+Measured on a fresh default container with `opcache.enable=On`:
+
+    opcache.memory_consumption      = 128 MiB
+    opcache.max_accelerated_files   = 4000
+    opcache.interned_strings_buffer = 8 MiB
+    opcache.validate_timestamps     = On
+
+All 1,513 PHP files in the webroot were compiled with
+`opcache_compile_file()` (21,412,735 source bytes):
+
+    used_memory        = 52,307,936 B
+    free_memory        = 81,909,792 B
+    num_cached_scripts = 1,513
+    max_cached_keys    = 7,963
+    oom_restarts       = 0
+    hash_restarts      = 0
+
+At roughly 34.6 KiB of shared memory per script, filling 128 MiB needs about
+3,700 unique scripts.  The default tree has 1,513; the `/usr/src/wordpress`
+copy is not web-reachable, and there is no unauthenticated way to add
+thousands of unique PHP files.  The persist failure that drives the type
+confusion is a shared-memory allocation failure, not a request `memory_limit`
+OOM, so ordinary OOM requests cannot substitute for it.  The route is not
+reachable on this default image without an application or plugin set that
+supplies more scripts.
+
+### 15.3 Fatal-error backtrace
+
+`last_fatal_error_backtrace` and `fatal_error_backtraces` were added in PHP
+8.5.  PHP 8.3/8.4, including this image's 8.3.35, contain neither; there is no
+stale backtrace field to consume and no `fatal_error_backtraces` setting to
+inspect.  On PHP 8.5 the setting is on by default and is the confirmed
+mod_php path; `display_errors=Off` does not block it, and the 8.5-only
+mitigation is `fatal_error_backtraces=0`.
+
 ## Appendix A: HTTP Request Shapes
 
     A:     PHPSESSID=NUL + progress + about 66 MB multipart -> 500

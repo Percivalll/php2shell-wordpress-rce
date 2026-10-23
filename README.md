@@ -64,9 +64,16 @@ docker run -d --name php2shell-target -p 18100:80 \
   wordpress:7.1.2
 
 cd exploit
-python3 run_ext.py --port 18100 --shell 'id>/var/www/html/pwn.txt'
+python3 run_ext.py --host 127.0.0.1 --port 18100 \
+  --shell 'id>/var/www/html/pwn.txt'
 curl http://127.0.0.1:18100/pwn.txt
 ```
+
+`--host` defaults to `127.0.0.1`, so existing local runs are unchanged.  The
+driver exports it as `WP_HOST` to every helper (`pin_adaptive`, `big_a`,
+`b_leak20`, `early_ok`, `arm_file2`, `stage_rce`), so the same code can point
+at a remote HTTP endpoint.  `demo.sh` accepts the same value through the
+`HOST` environment variable.
 
 `run_ext.py` starts the worker pin itself (all workers but one), performs the leak,
 arms the worker, installs the fake serializer, executes the command, and fetches
@@ -129,6 +136,68 @@ heap or timing failure.
   every address in that process shares the offending byte, so a different
   chunk or filler layout cannot escape it.  The driver detects it before
   arming; use a fresh container (or another target process).
+
+## Alternative primitives considered
+
+The working chain is the fake `ps_serializer` route.  Two alternatives were
+implemented far enough to measure their limits; both are negative results,
+not used code.
+
+### `PG(auto_prepend_file)` overwrite
+
+- `core_globals` is `libphp+0x1059100`; the runtime ini descriptor confirms
+  `auto_prepend_file` at `+0xa0` (`mh_arg1=0xa0`, `mh_arg2=&core_globals`).
+- The fake `var_entries` write does reach `base+0x10591a0`, but the value it
+  writes is the address of the unserializer's dtor temp zval, not a string.
+  The dtor zval then occupies that slot.
+- The fake-serializer chain survives this because its `decode` pointer is at
+  `H+0x320`, after the 16-byte dtor zval at `H+0x310`; a path string at
+  `H+0x310` is overwritten.
+- A 30 MiB `sess_r1big` is required to keep the session buffer out of `H`; a
+  326-byte session buffer was allocated at `H`, overwrote the fake
+  `php_unserialize_data` (`H+0x10` became 326) and crashed in `var_tmp_var`.
+- Upload-progress stores only one file (`files a:1`), and `type` is not in the
+  array, so there is no attacker-controlled large allocation after a small
+  filename.
+- A 30 MiB filename starting with the path does set `PG=H+0x310`, but after
+  the OOM the huge allocation is no longer a mapped `zend_string`, so it
+  cannot serve as the dtor slot.
+
+Conclusion: this route needs a raw 8-byte write primitive, or a much more
+precise mapped-chunk groom than `var_push` currently allows.
+
+### OPcache type confusion
+
+Measured on the default image (`opcache.enable=On`,
+`memory_consumption=128M`, `max_accelerated_files=4000`,
+`interned_strings_buffer=8M`):
+
+| Item | Value |
+|---|---|
+| WordPress PHP files in webroot | 1,513 |
+| Source bytes | 21,412,735 |
+| Opcache used after compiling all | 52,307,936 B |
+| Opcache free | 81,909,792 B |
+| Cached scripts | 1,513 |
+| `oom_restarts` / `hash_restarts` | 0 / 0 |
+
+At roughly 34.6 KiB of SHM per script, filling 128 MiB needs about 3,700
+unique scripts.  The default tree has 1,513; the `/usr/src/wordpress` copy is
+not web-reachable; there is no unauthenticated way to add thousands of unique
+PHP files.  The persist failure that drives the type confusion is a
+shared-memory allocation failure, not a request `memory_limit` OOM.  This
+route is not reachable on the default image without an application or plugin
+set that supplies more scripts.
+
+### Fatal-error backtrace
+
+`last_fatal_error_backtrace` and `fatal_error_backtraces` were added in PHP
+8.5.  PHP 8.3/8.4, including this image's 8.3.35, have neither, so there is no
+stale backtrace field to consume.  On PHP 8.5 the setting is on by default and
+is the confirmed mod_php path; `display_errors=Off` does not block it, and the
+8.5-only mitigation is `fatal_error_backtraces=0`.
+
+See REPORT.md section 15 for the measurements and exact failure points.
 
 ## Safety
 

